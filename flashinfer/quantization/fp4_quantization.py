@@ -384,6 +384,24 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
+        "flashinfer::block_scale_interleave_reverse_sm100",
+        mutates_args=("",),
+    )
+    def block_scale_interleave_reverse_sm100(
+        swizzled_sf: torch.Tensor,
+    ) -> torch.Tensor:
+        """Unswizzle F8_128x4 block scale storage into padded row-major storage."""
+        out = torch.empty_like(swizzled_sf)
+        module.block_scale_interleave_reverse_sm100(swizzled_sf, out)
+        return out
+
+    @register_fake_op("flashinfer::block_scale_interleave_reverse_sm100")
+    def _fake_block_scale_interleave_reverse_sm100(
+        swizzled_sf: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(swizzled_sf)
+
+    @register_custom_op(
         "flashinfer::fp4_batched_quantize_sm100",
         mutates_args=("",),
     )
@@ -777,6 +795,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
         block_scale_interleave_sm100=block_scale_interleave_sm100,
+        block_scale_interleave_reverse_sm100=block_scale_interleave_reverse_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
@@ -1038,6 +1057,20 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
         unswizzled_sf,
     )
+
+
+def _block_scale_interleave_reverse(swizzled_sf: torch.Tensor) -> torch.Tensor:
+    """Unswizzle F8_128x4 block scale storage into padded row-major storage."""
+    assert swizzled_sf.dtype == torch.uint8, (
+        f"Input dtype must be uint8, got {swizzled_sf.dtype}"
+    )
+
+    major, minor = get_compute_capability(swizzled_sf.device)
+    device_arch = f"{major * 10 + minor}"
+
+    return get_fp4_quantization_module(
+        device_arch
+    ).block_scale_interleave_reverse_sm100(swizzled_sf)
 
 
 # Maintain compatibility with libraries using the old name

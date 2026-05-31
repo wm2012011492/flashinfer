@@ -49,6 +49,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
+import math
 from typing import Any, Dict, Optional, Tuple
 
 import weakref
@@ -61,10 +62,17 @@ from ...trace.templates.moe import (
     cute_dsl_moe_wrapper_run_trace,
 )
 from ...autotuner import AutoTuner, is_in_profile_measurement
+from ...cute_dsl.utils import (
+    convert_sf_from_mma_layout,
+    convert_sf_to_mma_layout,
+    get_mma_sf_shape,
+)
+from ...fp8_quantization import mxfp8_quantize
 from ...utils import supported_compute_capability
 from .moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
+    moe_mask_invalid_rows,
     moe_output_memset_inplace,
     moe_sort,
 )
@@ -78,6 +86,7 @@ from .tuner import (
     ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
     VALID_TILE_SIZES,
+    get_cute_dsl_moe_quant_mode_config,
 )
 
 
@@ -98,6 +107,34 @@ def _get_cuda_graph_resources() -> Dict[str, Any]:
         _cuda_graph_resources["memset_event"] = torch.cuda.Event()
         _cuda_graph_resources["aux_stream"] = torch.cuda.Stream()
     return _cuda_graph_resources
+
+
+def _torch_dtype_to_cute_dsl_dtype(dtype: torch.dtype) -> str:
+    dtype_map = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+    try:
+        return dtype_map[dtype]
+    except KeyError as exc:
+        raise TypeError(f"Unsupported CuteDSL MoE output dtype: {dtype}") from exc
+
+
+def _raw_mma_sf_view(
+    sf: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """View raw MMA scale storage with the logical MMA scale strides."""
+    sf_k = math.ceil(k / sf_vec_size)
+    m_tiles = math.ceil(m / 128)
+    k_tiles = math.ceil(sf_k / 4)
+    shape = (32, 4, m_tiles, 4, k_tiles, num_groups)
+    strides = (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
+    return sf.reshape(-1).as_strided(shape, strides)
 
 
 # =============================================================================
@@ -146,6 +183,7 @@ def _moe_core_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
     enable_pdl: bool = True,
+    quant_mode: str = "nvfp4",
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -156,7 +194,7 @@ def _moe_core_impl(
     4. GEMM2 + Finalize: Second projection with atomic scatter
 
     Args:
-        x: Input tensor, NVFP4 quantized.
+        x: Quantized input tensor.
         x_sf: Scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
@@ -189,6 +227,7 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    quant_config = get_cute_dsl_moe_quant_mode_config(quant_mode)
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
@@ -235,33 +274,139 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
+    if quant_config.quant_mode == "mxfp8":
+        # moe_sort returns max-capacity buffers. Padding rows inside active
+        # expert tiles are not guaranteed to be initialized, but the gather
+        # kernel computes SFA addresses from token_id_mapping before applying
+        # the row predicate. Mark those rows invalid with a graph-safe CUDA
+        # utility kernel; do not call .item() or launch PyTorch masking ops
+        # here because the wrapper advertises CUDA graph capture support.
+        moe_mask_invalid_rows(
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            max_num_permuted_tokens=permuted_idx_to_expanded_idx.numel(),
+            tile_size=tile_size,
+        )
+
     # Record event for async memset synchronization
     if use_async_memset:
         main_event.record()
         moe_output.record_stream(aux_stream)
 
     # Step 2: GEMM1 + SwiGLU
-    intermediate, intermediate_sf = (
-        blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
-            a=x,
-            b=w1_weight,
-            a_scale=x_sf,
-            b_scale=w1_weight_sf,
-            alpha=w1_alpha,
-            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            out=gemm1_out,
-            out_scale=gemm1_out_scale,
-            global_scale=fc2_input_scale,
-            topk=top_k,
-            c_dtype="float4_e2m1fn",
-            mma_tiler_mn=gemm1_mma_tiler_mn,
-            cluster_shape_mn=gemm1_cluster_shape_mn,
+    intermediate_size = w2_weight.size(2)
+    if (
+        quant_config.quant_mode == "mxfp8"
+        and quant_config.gemm1_c_dtype == "float8_e4m3fn"
+        and intermediate_size % 128 != 0
+    ):
+        if intermediate_size % 64 != 0:
+            raise ValueError(
+                "MXFP8 CuteDSL MoE split GEMM1 path requires intermediate_size "
+                f"to be a multiple of 64, got {intermediate_size}."
+            )
+
+        # The fused GEMM1 FP8 scale epilogue is still NVFP4-oriented for this
+        # sparse gather shape and can emit inaccurate MXFP8 intermediates. For
+        # MXFP8 shapes like I=192, compute the interleaved [linear64, gate64]
+        # chunks as BF16, then quantize the assembled intermediate with the
+        # canonical MXFP8 quantizer before GEMM2.
+        permuted_m = permuted_idx_to_expanded_idx.numel()
+        w1_sf_2d = convert_sf_from_mma_layout(
+            w1_weight_sf,
+            m=2 * intermediate_size,
+            k=x.shape[1],
+            num_groups=num_local_experts,
+            sf_vec_size=quant_config.sf_vec_size,
+        ).view(num_local_experts, 2 * intermediate_size, -1)
+
+        intermediate_chunks = []
+        for chunk_start in range(0, intermediate_size, 64):
+            w1_chunk_start = 2 * chunk_start
+            w1_chunk = w1_weight[
+                :, w1_chunk_start : w1_chunk_start + 128, :
+            ].contiguous()
+            w1_sf_chunk = convert_sf_to_mma_layout(
+                w1_sf_2d[:, w1_chunk_start : w1_chunk_start + 128, :]
+                .contiguous()
+                .view(num_local_experts * 128, -1),
+                m=128,
+                k=x.shape[1],
+                num_groups=num_local_experts,
+                sf_vec_size=quant_config.sf_vec_size,
+            )
+
+            chunk, _ = blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
+                a=x,
+                b=w1_chunk,
+                a_scale=x_sf,
+                b_scale=w1_sf_chunk,
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=None,
+                out_scale=None,
+                global_scale=None,
+                topk=top_k,
+                ab_dtype=quant_config.ab_dtype,
+                sf_dtype=quant_config.sf_dtype,
+                c_dtype="bfloat16",
+                sf_vec_size=quant_config.sf_vec_size,
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                enable_pdl=enable_pdl,
+            )
+            intermediate_chunks.append(chunk)
+
+        intermediate_bf16 = torch.cat(intermediate_chunks, dim=1).contiguous()
+        intermediate, intermediate_sf_2d = mxfp8_quantize(
+            intermediate_bf16,
+            is_sf_swizzled_layout=True,
+            alignment=quant_config.sf_vec_size,
             enable_pdl=enable_pdl,
         )
-    )
+        intermediate_sf = convert_sf_to_mma_layout(
+            intermediate_sf_2d.view(
+                math.ceil(permuted_m / 128) * 128,
+                math.ceil(math.ceil(intermediate_size / quant_config.sf_vec_size) / 4)
+                * 4,
+            ),
+            m=permuted_m,
+            k=intermediate_size,
+            sf_vec_size=quant_config.sf_vec_size,
+        )
+    else:
+        gemm1_out_arg = gemm1_out
+        if quant_config.quant_mode == "mxfp8" and gemm1_out is not None:
+            gemm1_out_arg = gemm1_out[: permuted_idx_to_expanded_idx.numel()]
+
+        intermediate, intermediate_sf = (
+            blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
+                a=x,
+                b=w1_weight,
+                a_scale=x_sf,
+                b_scale=w1_weight_sf,
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=gemm1_out_arg,
+                out_scale=gemm1_out_scale,
+                global_scale=fc2_input_scale,
+                topk=top_k,
+                ab_dtype=quant_config.ab_dtype,
+                sf_dtype=quant_config.sf_dtype,
+                c_dtype=quant_config.gemm1_c_dtype,
+                sf_vec_size=quant_config.sf_vec_size,
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                enable_pdl=enable_pdl,
+            )
+        )
 
     # Step 3: Zero the active output slice before GEMM2 finalize.
     # Finalize uses atomic scatter-add into `moe_output`, so it must start
@@ -299,6 +444,10 @@ def _moe_core_impl(
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
         out=moe_output,
+        ab_dtype=quant_config.ab_dtype,
+        sf_dtype=quant_config.sf_dtype,
+        out_dtype=_torch_dtype_to_cute_dsl_dtype(output_dtype),
+        sf_vec_size=quant_config.sf_vec_size,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
@@ -365,10 +514,11 @@ class CuteDslMoEWrapper:
         num_local_experts: Optional[int] = None,
         local_expert_offset: int = 0,
         tile_size: int = 128,
-        sf_vec_size: int = 16,
+        sf_vec_size: Optional[int] = None,
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         enable_pdl: bool = True,
+        quant_mode: str = "nvfp4",
     ):
         """Initialize the MoE wrapper.
 
@@ -382,11 +532,19 @@ class CuteDslMoEWrapper:
             num_local_experts: Local experts for EP. Default: num_experts.
             local_expert_offset: Expert offset for EP. Default: 0.
             tile_size: Tile size for moe_sort. Default: 128.
-            sf_vec_size: Scale factor vector size. Default: 16.
+            sf_vec_size: Scale factor vector size. Defaults to the quant mode.
             output_dtype: Output data type. Default: torch.bfloat16.
             device: Device for buffer allocation. Default: "cuda".
             enable_pdl: Enable Programmatic Dependent Launch. Default: True.
+            quant_mode: Quantization mode, ``"nvfp4"`` or ``"mxfp8"``.
         """
+        quant_config = get_cute_dsl_moe_quant_mode_config(quant_mode)
+        if sf_vec_size is not None and sf_vec_size != quant_config.sf_vec_size:
+            raise ValueError(
+                f"sf_vec_size={sf_vec_size} does not match "
+                f"quant_mode={quant_config.quant_mode!r} "
+                f"(expected {quant_config.sf_vec_size})"
+            )
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -396,7 +554,9 @@ class CuteDslMoEWrapper:
         self.num_local_experts = num_local_experts or num_experts
         self.local_expert_offset = local_expert_offset
         self.tile_size = tile_size
-        self.sf_vec_size = sf_vec_size
+        self.quant_config = quant_config
+        self.quant_mode = quant_config.quant_mode
+        self.sf_vec_size = quant_config.sf_vec_size
         self.output_dtype = output_dtype
         self.device = device
         self.enable_pdl = enable_pdl
@@ -432,6 +592,7 @@ class CuteDslMoEWrapper:
             use_fused_finalize=True,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
+            quant_mode=self.quant_mode,
         )
 
         if use_cuda_graph:
@@ -488,16 +649,24 @@ class CuteDslMoEWrapper:
             (max_permuted_across_tiles,), dtype=torch.int32, device=self.device
         )
 
-        # GEMM1 output (FP4 quantized)
+        # GEMM1 output (quantized for GEMM2 input)
         self._gemm1_output = torch.empty(
-            (max_permuted_across_tiles, self.intermediate_size // 2),
-            dtype=torch.uint8,
+            (
+                max_permuted_across_tiles,
+                self.intermediate_size
+                // self.quant_config.gemm1_output_elements_per_storage,
+            ),
+            dtype=self.quant_config.gemm1_output_dtype,
             device=self.device,
         )
 
         # GEMM1 output scale
-        scale_size = max_permuted_across_tiles * (
-            self.intermediate_size // self.sf_vec_size
+        scale_size = math.prod(
+            get_mma_sf_shape(
+                max_permuted_across_tiles,
+                self.intermediate_size,
+                sf_vec_size=self.sf_vec_size,
+            )
         )
         self._gemm1_output_scale = torch.empty(
             (scale_size,), dtype=torch.uint8, device=self.device
@@ -541,6 +710,7 @@ class CuteDslMoEWrapper:
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
+        quant_mode: str = "nvfp4",
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -602,6 +772,7 @@ class CuteDslMoEWrapper:
             output_dtype=output_dtype,
             use_async_memset=True,
             enable_pdl=enable_pdl,
+            quant_mode=quant_mode,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -728,6 +899,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    quant_mode: str = "nvfp4",
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -756,7 +928,85 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         output_dtype=output_dtype,
         use_async_memset=True,
         enable_pdl=enable_pdl,
+        quant_mode=quant_mode,
     )
+
+
+def _cute_dsl_fused_moe_quantized(
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: Optional[int],
+    local_expert_offset: int,
+    output_dtype: torch.dtype,
+    use_fused_finalize: bool,
+    moe_output: Optional[torch.Tensor],
+    aux_stream: Optional[torch.cuda.Stream],
+    enable_pdl: bool,
+    quant_mode: str,
+    tune_key: str,
+) -> torch.Tensor:
+    if num_local_experts is None:
+        num_local_experts = num_experts
+
+    num_tokens = token_selected_experts.size(0)
+    hidden_size = w2_weight.size(1)
+
+    if moe_output is None:
+        moe_output = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=output_dtype,
+            device=x.device,
+        )
+
+    tuner = AutoTuner.get()
+
+    runner = CuteDslFusedMoENvfp4Runner(
+        forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        use_fused_finalize=use_fused_finalize,
+        output_dtype=output_dtype,
+        enable_pdl=enable_pdl,
+        quant_mode=quant_mode,
+    )
+
+    inputs = [
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        fc2_input_scale,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        moe_output,
+    ]
+
+    _, best_tactic = tuner.choose_one(
+        tune_key,
+        [runner],
+        runner.tuning_config,
+        inputs,
+        aux_stream=aux_stream,
+    )
+
+    return runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
 
 
 @supported_compute_capability([100, 103])
@@ -819,59 +1069,90 @@ def cute_dsl_fused_moe_nvfp4(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    if num_local_experts is None:
-        num_local_experts = num_experts
-
-    num_tokens = token_selected_experts.size(0)
-    hidden_size = w2_weight.size(1)
-
-    if moe_output is None:
-        moe_output = torch.empty(
-            (num_tokens, hidden_size),
-            dtype=output_dtype,
-            device=x.device,
-        )
-
-    tuner = AutoTuner.get()
-
-    runner = CuteDslFusedMoENvfp4Runner(
-        forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+    return _cute_dsl_fused_moe_quantized(
+        x=x,
+        x_sf=x_sf,
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        w1_weight=w1_weight,
+        w1_weight_sf=w1_weight_sf,
+        w1_alpha=w1_alpha,
+        fc2_input_scale=fc2_input_scale,
+        w2_weight=w2_weight,
+        w2_weight_sf=w2_weight_sf,
+        w2_alpha=w2_alpha,
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
         local_expert_offset=local_expert_offset,
-        use_fused_finalize=use_fused_finalize,
         output_dtype=output_dtype,
-        enable_pdl=enable_pdl,
-    )
-
-    inputs = [
-        x,
-        x_sf,
-        token_selected_experts,
-        token_final_scales,
-        w1_weight,
-        w1_weight_sf,
-        w1_alpha,
-        fc2_input_scale,
-        w2_weight,
-        w2_weight_sf,
-        w2_alpha,
-        moe_output,
-    ]
-
-    _, best_tactic = tuner.choose_one(
-        "CuteDslFusedMoE::run_moe_nvfp4",
-        [runner],
-        runner.tuning_config,
-        inputs,
+        use_fused_finalize=use_fused_finalize,
+        moe_output=moe_output,
         aux_stream=aux_stream,
+        enable_pdl=enable_pdl,
+        quant_mode="nvfp4",
+        tune_key="CuteDslFusedMoE::run_moe_nvfp4",
     )
 
-    return runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
+
+@supported_compute_capability([100, 103])
+@flashinfer_api
+def cute_dsl_fused_moe_mxfp8(
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
+    output_dtype: torch.dtype = torch.bfloat16,
+    use_fused_finalize: bool = True,
+    moe_output: Optional[torch.Tensor] = None,
+    aux_stream: Optional[torch.cuda.Stream] = None,
+    enable_pdl: bool = True,
+) -> torch.Tensor:
+    """Run fused MoE computation using CuteDSL MXFP8 kernels.
+
+    Inputs and weights must already be MXFP8 quantized with E8M0 scale
+    factors and ``sf_vec_size=32``. For CUDA graph support, use
+    ``CuteDslMoEWrapper(..., quant_mode="mxfp8")``.
+    """
+    return _cute_dsl_fused_moe_quantized(
+        x=x,
+        x_sf=x_sf,
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        w1_weight=w1_weight,
+        w1_weight_sf=w1_weight_sf,
+        w1_alpha=w1_alpha,
+        fc2_input_scale=fc2_input_scale,
+        w2_weight=w2_weight,
+        w2_weight_sf=w2_weight_sf,
+        w2_alpha=w2_alpha,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        output_dtype=output_dtype,
+        use_fused_finalize=use_fused_finalize,
+        moe_output=moe_output,
+        aux_stream=aux_stream,
+        enable_pdl=enable_pdl,
+        quant_mode="mxfp8",
+        tune_key="CuteDslFusedMoE::run_moe_mxfp8",
+    )
 
 
 __all__ = [
     "cute_dsl_fused_moe_nvfp4",
+    "cute_dsl_fused_moe_mxfp8",
     "CuteDslMoEWrapper",
 ]

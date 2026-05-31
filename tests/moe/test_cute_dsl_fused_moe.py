@@ -2122,6 +2122,75 @@ class TestPreallocStaticInvariants:
         )
 
 
+@cute_dsl_available
+class TestCuteDslMoEQuantModeConfig:
+    """No-GPU structural invariants for CuteDSL MoE quantization modes."""
+
+    def test_mxfp8_quant_mode_uses_e8m0_sf_vec32(self):
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            get_cute_dsl_moe_quant_mode_config,
+        )
+
+        cfg = get_cute_dsl_moe_quant_mode_config("mxfp8")
+
+        assert cfg.ab_dtype == "float8_e4m3fn"
+        assert cfg.sf_dtype == "float8_e8m0fnu"
+        assert cfg.sf_vec_size == 32
+        assert cfg.gemm1_c_dtype == "float8_e4m3fn"
+        assert cfg.gemm1_output_dtype == torch.float8_e4m3fn
+        assert cfg.gemm1_output_elements_per_storage == 1
+
+    def test_runner_hash_distinguishes_nvfp4_and_mxfp8(self):
+        from flashinfer.fused_moe.cute_dsl.tuner import CuteDslFusedMoENvfp4Runner
+
+        def forward_impl(**kwargs):
+            return kwargs["moe_output"]
+
+        common_kwargs = dict(
+            forward_impl=forward_impl,
+            num_experts=8,
+            top_k=2,
+            num_local_experts=8,
+        )
+        nvfp4 = CuteDslFusedMoENvfp4Runner(**common_kwargs, quant_mode="nvfp4")
+        mxfp8 = CuteDslFusedMoENvfp4Runner(**common_kwargs, quant_mode="mxfp8")
+
+        assert nvfp4.quant_mode == "nvfp4"
+        assert mxfp8.quant_mode == "mxfp8"
+        assert hash(nvfp4) != hash(mxfp8)
+
+    def test_mxfp8_valid_tactics_support_intermediate_192(self):
+        from flashinfer.fused_moe.cute_dsl.tuner import CuteDslFusedMoENvfp4Runner
+
+        def forward_impl(**kwargs):
+            return kwargs["moe_output"]
+
+        runner = CuteDslFusedMoENvfp4Runner(
+            forward_impl=forward_impl,
+            num_experts=8,
+            top_k=8,
+            num_local_experts=8,
+            quant_mode="mxfp8",
+        )
+        inputs = [
+            torch.empty(8, 4096, dtype=torch.float8_e4m3fn),
+            torch.empty(8, 128, 1, dtype=torch.uint8),
+            torch.empty(8, 8, dtype=torch.int32),
+            torch.empty(8, 8, dtype=torch.float32),
+            torch.empty(8, 384, 4096, dtype=torch.float8_e4m3fn),
+            torch.empty(32, 4, 3, 4, 32, 8, dtype=torch.uint8),
+            torch.empty(8, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(8, 4096, 192, dtype=torch.float8_e4m3fn),
+            torch.empty(32, 4, 32, 4, 2, 8, dtype=torch.uint8),
+            torch.empty(8, dtype=torch.float32),
+        ]
+
+        tactics = runner.get_valid_tactics(inputs, profile=None)
+
+        assert tactics, "MXFP8 MoE should have valid tactics for intermediate_size=192"
+
+
 # =============================================================================
 # Test Class: CuteDslMoEWrapper prealloc-buffer integration (GPU required)
 # =============================================================================

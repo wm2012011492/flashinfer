@@ -56,6 +56,7 @@ from flashinfer.cute_dsl.utils import (
     cutlass_to_torch_dtype,
     get_num_sm,
     get_max_active_clusters,
+    get_mma_sf_shape,
     make_ptr,
 )
 
@@ -455,36 +456,40 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    # Check if we're doing FP4 quantization
-    generate_sfc = c_dtype == "float4_e2m1fn"
+    # Check if we're generating block-scaled quantized output.
+    generate_sfc = c_dtype in ("float4_e2m1fn", "float8_e4m3fn", "float8_e5m2")
     if generate_sfc:
         if global_scale is None:
-            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+            raise ValueError(f"global_scale is required when c_dtype is {c_dtype!r}")
+
+    if generate_sfc and c_dtype == "float4_e2m1fn":
+        # FP4 output is packed: two logical values per uint8 storage element.
+        expected_out_shape = (permuted_m, intermediate_size // 2)
+        expected_out_dtype = torch.uint8
+    else:
+        # FP8 and dense outputs are stored one logical value per element.
+        expected_out_shape = (permuted_m, intermediate_size)
+        expected_out_dtype = cutlass_to_torch_dtype(c_dtype_cutlass)
 
     # Create output tensor if not provided
     if out is None:
-        if generate_sfc:
-            # FP4 output: 2 values per byte
-            out = torch.empty(
-                (permuted_m, intermediate_size // 2),
-                dtype=torch.uint8,
-                device=a.device,
-            )
-        else:
-            out = torch.empty(
-                (permuted_m, intermediate_size),
-                dtype=cutlass_to_torch_dtype(c_dtype_cutlass),
-                device=a.device,
-            )
+        out = torch.empty(
+            expected_out_shape,
+            dtype=expected_out_dtype,
+            device=a.device,
+        )
+    elif tuple(out.shape) != expected_out_shape or out.dtype != expected_out_dtype:
+        raise ValueError(
+            "Output tensor shape/dtype mismatch for gather SwiGLU kernel: "
+            f"expected shape={expected_out_shape}, dtype={expected_out_dtype}, "
+            f"got shape={tuple(out.shape)}, dtype={out.dtype}."
+        )
 
     # Create output scale tensor if needed and not provided
     if generate_sfc and out_scale is None:
-        # Scale factor layout for output
-        scale_intermediate_size = intermediate_size // sf_vec_size
-        # MMA-compatible scale factor shape
         out_scale = torch.empty(
-            (32, 4, permuted_m // 128, 4, scale_intermediate_size // 4, 1),
-            dtype=torch.uint8,  # FP8 E4M3
+            get_mma_sf_shape(permuted_m, intermediate_size, sf_vec_size=sf_vec_size),
+            dtype=torch.uint8,
             device=a.device,
         )
 
@@ -518,8 +523,11 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     )
 
     if generate_sfc:
+        c_sf_storage_dtype = (
+            cutlass.Uint8 if sf_dtype == "float8_e8m0fnu" else sf_dtype_cutlass
+        )
         c_sf_ptr = make_ptr(
-            sf_dtype_cutlass,
+            c_sf_storage_dtype,
             out_scale.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,

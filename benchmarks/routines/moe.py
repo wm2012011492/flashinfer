@@ -96,6 +96,8 @@ def run_moe_test(args):
         return testCutlassFusedMoe(args)
     elif args.routine == "cute_dsl_fp4_block_scale_moe":
         return testCuteDslFp4BlockScaleMoe(args)
+    elif args.routine == "cute_dsl_mxfp8_block_scale_moe":
+        return testCuteDslMxfp8BlockScaleMoe(args)
     elif args.routine == "b12x_fused_moe":
         return testB12xFusedMoe(args)
     elif args.routine == "bgmv_moe":
@@ -222,7 +224,9 @@ def parse_moe_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe and cutlass_fused_moe)."
+            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe, "
+            "cutlass_fused_moe, cute_dsl_fp4_block_scale_moe, and "
+            "cute_dsl_mxfp8_block_scale_moe)."
         ),
     )
     parser.add_argument(
@@ -247,9 +251,9 @@ def parse_moe_args(line, parser):
         default=False,
         help=(
             "Use the functional MoE API instead of the wrapper class: "
-            "cute_dsl_fused_moe_nvfp4 vs CuteDslMoEWrapper for "
-            "cute_dsl_fp4_block_scale_moe, and b12x_fused_moe vs B12xMoEWrapper for "
-            "b12x_fused_moe. Useful for verifying that the wrapper's workspace cache "
+            "cute_dsl_fused_moe_nvfp4/cute_dsl_fused_moe_mxfp8 vs CuteDslMoEWrapper "
+            "for CuteDSL SM100 MoE routines, and b12x_fused_moe vs B12xMoEWrapper "
+            "for b12x_fused_moe. Useful for verifying that the wrapper's workspace cache "
             "eliminates per-call allocation overhead."
         ),
     )
@@ -1360,6 +1364,103 @@ def _create_nvfp4_moe_test_data(
     }
 
 
+def _create_mxfp8_moe_test_data(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: torch.device,
+):
+    """Create MXFP8-quantized test data for SM100 CuteDSL MoE kernels."""
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    sf_vec_size = 32
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    x_quantized, x_sf = mxfp8_quantize(
+        x_bf16,
+        is_sf_swizzled_layout=False,
+    )
+    x_sf = x_sf.view(num_tokens, hidden_size // sf_vec_size).unsqueeze(-1)
+
+    routing_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights, selected_experts = compute_routing(routing_logits, top_k)
+    selected_experts = selected_experts.to(torch.int32)
+
+    w1_rows = 2 * intermediate_size
+    w1_bf16 = (
+        torch.randn(
+            num_local_experts,
+            w1_rows,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w1_bf16 = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    w1_flat = w1_bf16.view(num_local_experts * w1_rows, hidden_size)
+    w1_q_flat, w1_sf_flat = mxfp8_quantize(
+        w1_flat,
+        is_sf_swizzled_layout=True,
+    )
+    w1_weight = w1_q_flat.view(num_local_experts, w1_rows, hidden_size)
+    w1_weight_sf = convert_sf_to_mma_layout(
+        w1_sf_flat,
+        m=w1_rows,
+        k=hidden_size,
+        num_groups=num_local_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+
+    w2_bf16 = (
+        torch.randn(
+            num_local_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+    w2_q_flat, w2_sf_flat = mxfp8_quantize(
+        w2_flat,
+        is_sf_swizzled_layout=True,
+    )
+    w2_weight = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size)
+    w2_weight_sf = convert_sf_to_mma_layout(
+        w2_sf_flat,
+        m=hidden_size,
+        k=intermediate_size,
+        num_groups=num_local_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+
+    fc2_input_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
+
+    return {
+        "x": x_quantized,
+        "x_bf16": x_bf16,
+        "x_sf": x_sf,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight": w1_weight,
+        "w1_weight_sf": w1_weight_sf,
+        "w1_alpha": w1_alpha,
+        "fc2_input_scale": fc2_input_scale,
+        "w2_weight": w2_weight,
+        "w2_weight_sf": w2_weight_sf,
+        "w2_alpha": w2_alpha,
+    }
+
+
 def testCuteDslFp4BlockScaleMoe(args):
     """
     Test cute_dsl_fp4_block_scale_moe (CuTe DSL NVFP4 MoE on SM100/SM103).
@@ -1619,6 +1720,249 @@ def testCuteDslFp4BlockScaleMoe(args):
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         cur_res["fp4_mode"] = "nvfp4"
+        cur_res["activation_type"] = activation_type.name
+        res.append(cur_res)
+
+    return res
+
+
+def testCuteDslMxfp8BlockScaleMoe(args):
+    """
+    Test cute_dsl_mxfp8_block_scale_moe (CuTe DSL MXFP8 MoE on SM100/SM103).
+
+    This test creates MXFP8-quantized inputs/weights with E8M0 scale factors,
+    runs MoE via CuteDslMoEWrapper (or cute_dsl_fused_moe_mxfp8 when
+    ``--use_functional_api`` is set), and reports TFLOPS/TB/sec.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testCuteDslMxfp8BlockScaleMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    from flashinfer import CuteDslMoEWrapper
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    local_expert_offset = args.local_expert_offset
+    local_num_experts = args.local_num_experts or num_experts
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = ["cute-dsl"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
+        )
+
+    activation_type = args.activation_type
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError(
+            f"cute_dsl_mxfp8_block_scale_moe only supports Swiglu activation, "
+            f"got {activation_type.name}. Use --routine b12x_fused_moe for ReLU2."
+        )
+
+    tensors = _create_mxfp8_moe_test_data(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=local_num_experts,
+        top_k=top_k,
+        device=device,
+    )
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] x.shape = {tensors['x'].shape}")
+        print(f"[VVERBOSE] x_sf.shape = {tensors['x_sf'].shape}")
+        print(f"[VVERBOSE] w1_weight.shape = {tensors['w1_weight'].shape}")
+        print(f"[VVERBOSE] w1_weight_sf.shape = {tensors['w1_weight_sf'].shape}")
+        print(f"[VVERBOSE] w2_weight.shape = {tensors['w2_weight'].shape}")
+        print(f"[VVERBOSE] w2_weight_sf.shape = {tensors['w2_weight_sf'].shape}")
+
+    use_functional = getattr(args, "use_functional_api", False)
+
+    if use_functional:
+        from functools import partial
+        from flashinfer import cute_dsl_fused_moe_mxfp8
+
+        moe_output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
+
+        if args.verbose >= 1:
+            print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe_mxfp8)")
+        runner = partial(
+            cute_dsl_fused_moe_mxfp8,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            moe_output=moe_output,
+        )
+
+        runner(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+    else:
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=is_cuda_graph_compatible,
+            max_num_tokens=num_tokens,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            quant_mode="mxfp8",
+        )
+        runner = moe.run
+
+    def run_cute_dsl_moe(
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        fc2_input_scale,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+    ):
+        return runner(
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+        )
+
+    input_args = (
+        tensors["x"],
+        tensors["x_sf"],
+        tensors["token_selected_experts"],
+        tensors["token_final_scales"],
+        tensors["w1_weight"],
+        tensors["w1_weight_sf"],
+        tensors["w1_alpha"],
+        tensors["fc2_input_scale"],
+        tensors["w2_weight"],
+        tensors["w2_weight_sf"],
+        tensors["w2_alpha"],
+    )
+
+    num_active_experts = int(tensors["token_selected_experts"].unique().numel())
+
+    backend = "cute-dsl"
+
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        backend = "cute-dsl_autotune"
+        if args.verbose >= 1:
+            print(f"[INFO] Autotune warmup for CuteDSL MXFP8 MoE: {warmup_iters} iters")
+        autotune_args = tuple(
+            t.clone() if isinstance(t, torch.Tensor) else t for t in input_args
+        )
+        with autotune(True):
+            for _ in range(warmup_iters):
+                run_cute_dsl_moe(*autotune_args)
+        del autotune_args
+
+    times = bench_gpu_time(
+        fn=run_cute_dsl_moe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        cold_l2_cache=True,
+        input_args=input_args,
+    )
+
+    median_time = np.median(times)
+    std_time = np.std(times)
+    tflops = calculate_moe_tflops(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        is_gated=True,
+    )
+    tb_per_sec = calculate_moe_kernel_bandwidth(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        weight_dtype,
+        input_format="mxfp8",
+        weight_format="mxfp8",
+        routing_logits_dtype=None,
+        active_experts=num_active_experts,
+        verbose=args.verbose,
+        is_gated=True,
+    )
+
+    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+    if args.output_path is not None:
+        cur_res = defaultdict(str)
+        cur_res["routine"] = args.routine
+        cur_res["median_time"] = median_time
+        cur_res["std_time"] = std_time
+        cur_res["tflops"] = tflops
+        cur_res["tb_per_sec"] = tb_per_sec
+        cur_res["backend"] = backend
+        cur_res["num_tokens"] = num_tokens
+        cur_res["hidden_size"] = hidden_size
+        cur_res["intermediate_size"] = intermediate_size
+        cur_res["num_experts"] = num_experts
+        cur_res["top_k"] = top_k
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["input_dtype"] = input_dtype
+        cur_res["weight_dtype"] = weight_dtype
+        cur_res["fp4_mode"] = "mxfp8"
         cur_res["activation_type"] = activation_type.name
         res.append(cur_res)
 

@@ -94,6 +94,7 @@ from .fused_moe import (
 with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe_mxfp8 as cute_dsl_fused_moe_mxfp8,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,

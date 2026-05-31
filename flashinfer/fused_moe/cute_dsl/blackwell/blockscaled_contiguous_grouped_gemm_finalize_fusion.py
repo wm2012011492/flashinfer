@@ -1909,6 +1909,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 permuted_row = tile_m_start + epi_tidx
                 expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
                 is_valid_row = permuted_row < tile_info[4]
+                is_valid_row &= expanded_idx >= 0
 
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
@@ -2644,7 +2645,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        scale_k = k // scaling_vector_size
+        scale_k = cute.ceil_div(k, scaling_vector_size)
+        scale_k_tiles = cute.ceil_div(scale_k, 4)
         num_tiles = m // tile_size
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
@@ -2655,13 +2657,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         a_sf = cute.make_tensor(
             a_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, scale_k // 4, 1), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, cute.ceil_div(m, 128), 4, scale_k_tiles, 1),
+                order=(2, 1, 4, 0, 3, 5),
             ),
         )
         b_sf = cute.make_tensor(
             b_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, cute.ceil_div(n, 128), 4, scale_k_tiles, l),
+                order=(2, 1, 4, 0, 3, 5),
             ),
         )
         c = cute.make_tensor(

@@ -27,6 +27,23 @@ from flashinfer.fused_moe.utils import make_random_topk_ids
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
+FP8_BLOCK_MOE_INTERMEDIATE_ALIGNMENT = 128
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _zero_padded_swiglu_intermediate(
+    w13: torch.Tensor, w2: torch.Tensor, intermediate_size: int
+) -> None:
+    padded_intermediate_size = w2.shape[-1]
+    if padded_intermediate_size == intermediate_size:
+        return
+
+    w13[:, intermediate_size:padded_intermediate_size, :] = 0
+    w13[:, padded_intermediate_size + intermediate_size :, :] = 0
+    w2[:, :, intermediate_size:] = 0
 
 
 def _pack_topk(
@@ -134,18 +151,36 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
     is_block_scale = quant_mode != "Fp8-Per-Tensor"
+    kernel_intermediate_size = (
+        _round_up(intermediate_size, FP8_BLOCK_MOE_INTERMEDIATE_ALIGNMENT)
+        if is_block_scale
+        else intermediate_size
+    )
     tune_max = (
         max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
     )
 
+    if kernel_intermediate_size != intermediate_size:
+        print(
+            f"Padding FP8 block-scale intermediate_size from {intermediate_size} "
+            f"to {kernel_intermediate_size}; TRT-LLM generated GEMM configs "
+            f"require a multiple of {FP8_BLOCK_MOE_INTERMEDIATE_ALIGNMENT}."
+        )
+
+    if is_block_scale:
+        assert activation_type == ActivationType.Swiglu.value, (
+            "Only Swiglu activation is supported for FP8 block scale MoE."
+        )
+
     # --- num_tokens-independent setup ---
     routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
     w13 = torch.randn(
-        num_experts, intermediate_size * 2, hidden_size, device=device
+        num_experts, kernel_intermediate_size * 2, hidden_size, device=device
     ).to(torch.bfloat16)
-    w2 = torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
-        torch.bfloat16
-    )
+    w2 = torch.randn(
+        num_experts, hidden_size, kernel_intermediate_size, device=device
+    ).to(torch.bfloat16)
+    _zero_padded_swiglu_intermediate(w13, w2, intermediate_size)
 
     scale_vec_size = 128 if quant_mode == "Fp8-Block" else 32
     if quant_mode == "Fp8-Per-Tensor":
@@ -170,7 +205,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         w13_scale = torch.full(
             (
                 num_experts,
-                intermediate_size * 2 // scale_vec_size,
+                kernel_intermediate_size * 2 // scale_vec_size,
                 hidden_size // scale_vec_size,
             ),
             w13_scalar.item(),
@@ -180,7 +215,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             (
                 num_experts,
                 hidden_size // scale_vec_size,
-                intermediate_size // scale_vec_size,
+                kernel_intermediate_size // scale_vec_size,
             ),
             w2_scalar.item(),
             device=device,
@@ -189,14 +224,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         w13, w13_scale = mxfp8_quantize(w13, True)
         w2, w2_scale = mxfp8_quantize(w2, True)
         w13_scale = w13_scale.view(torch.uint8).reshape(
-            num_experts, intermediate_size * 2, -1
+            num_experts, kernel_intermediate_size * 2, -1
         )
         w2_scale = w2_scale.view(torch.uint8).reshape(num_experts, hidden_size, -1)
-
-    if is_block_scale:
-        assert activation_type == ActivationType.Swiglu.value, (
-            "Only Swiglu activation is supported for FP8 block scale MoE."
-        )
 
     setups = []
     for batch_size in num_tokens_list:
@@ -252,7 +282,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 top_k=top_k,
                 n_group=None if routed else 8,
                 topk_group=None if routed else 4,
-                intermediate_size=intermediate_size,
+                intermediate_size=kernel_intermediate_size,
                 local_expert_offset=0,
                 local_num_experts=num_experts,
                 routed_scaling_factor=2.5,
@@ -291,12 +321,15 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         setups.append((batch_size, fn, input_kwargs))
 
     mode_str = "routed" if routed else "non_routed"
+    intermediate_str = f"intermediate={intermediate_size}"
+    if kernel_intermediate_size != intermediate_size:
+        intermediate_str += f"  kernel_intermediate={kernel_intermediate_size}"
     _run_benchmark(
         setups,
         warmups,
         iterations,
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
-        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        f"  hidden={hidden_size}  {intermediate_str}  top_k={top_k}",
     )
 
 

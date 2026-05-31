@@ -40,6 +40,11 @@ from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import Int32
 
+from flashinfer.quantization.quantization_cute_dsl_utils import (
+    float_to_ue8m0_fast,
+    ue8m0_to_inv_scale_fast,
+)
+
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     fmin,
@@ -582,7 +587,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.mma_tiler_sfa = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
-            mma_inst_shape_k * mma_inst_tile_k // 16,
+            mma_inst_shape_k * mma_inst_tile_k // self.sf_vec_size,
         )
 
         self.mma_tiler_sfb = (
@@ -828,6 +833,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 c.shape, self.sf_vec_size
             )
             sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
+            self.sfc_dtype = sfc_tensor.element_type
+        else:
+            self.sfc_dtype = self.sf_dtype
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -1588,7 +1596,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ):
             #
             # Setup LDGSTS copy atoms for A and SFA
-            # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix (32 elements per thread)
+            # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix.
+            # The logical element count per 128-bit copy depends on the
+            # operand dtype: 32 FP4 values or 16 FP8 values.
             # SFA: 4x LDGSTS.32 per thread with 512-element block swizzling for scale factor A (4 elements per thread)
             #
             a_atom_copy = cute.make_copy_atom(
@@ -1596,8 +1606,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 mA_mkl.element_type,
                 num_bits_per_copy=128,
             )
+            a_elements_per_copy = 128 // self.a_dtype.width
             a_thread_layout = cute.make_layout((16, 8), stride=(8, 1))
-            a_value_layout = cute.make_layout((1, 32), stride=(32, 1))
+            a_value_layout = cute.make_layout(
+                (1, a_elements_per_copy), stride=(a_elements_per_copy, 1)
+            )
             a_tiled_copy = cute.make_tiled_copy_tv(
                 a_atom_copy,
                 a_thread_layout,
@@ -1683,19 +1696,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 for i in range(8):
                     token_ml_tile_offset = (tidx_in_warpgroup // 8) + i * 16
                     a_token_offset_tensor[i] = gToken_ml_tile[token_ml_tile_offset]
-                    a_predicate_tensor[i] = (
-                        cutlass.Boolean(1)
-                        if tile_info[0] * self.cta_tile_shape_mnk[0]
-                        + token_ml_tile_offset
+                    is_valid_a_token = (
+                        tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
                         < tile_info[4]
-                        else cutlass.Boolean(0)
                     )
+                    is_valid_a_token &= a_token_offset_tensor[i] >= 0
+                    a_predicate_tensor[i] = is_valid_a_token
                     a_token_offset_tensor[i] = (
-                        a_token_offset_tensor[i] // self.topk
-                        if tile_info[0] * self.cta_tile_shape_mnk[0]
-                        + token_ml_tile_offset
-                        < tile_info[4]
-                        else 0
+                        a_token_offset_tensor[i] // self.topk if is_valid_a_token else 0
                     )
 
                 token_ml_tile_offset = (
@@ -1703,20 +1711,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     + 32 * ((tidx_in_warpgroup % 32) // 8)
                     + (tidx_in_warpgroup % 8)
                 )
-                sfa_token_offset_tensor[0] = (
-                    gToken_ml_tile[token_ml_tile_offset] // self.topk
-                )
-                sfa_predicate_tensor[0] = (
-                    cutlass.Boolean(1)
-                    if tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
+                sfa_token_offset_tensor[0] = gToken_ml_tile[token_ml_tile_offset]
+                is_valid_sfa_token = (
+                    tile_info[0] * self.cta_tile_shape_mnk[0] + token_ml_tile_offset
                     < tile_info[4]
-                    else cutlass.Boolean(0)
+                )
+                is_valid_sfa_token &= sfa_token_offset_tensor[0] >= 0
+                sfa_predicate_tensor[0] = is_valid_sfa_token
+                sfa_token_offset_tensor[0] = (
+                    sfa_token_offset_tensor[0] // self.topk if is_valid_sfa_token else 0
                 )
                 relative_sfa_token_offset = sfa_token_offset_tensor[0]
 
                 tAgA = gA_mkl[(None, None, 0, None, 0)]
                 A_gmem_thread_offset = cute.assume(
-                    (tidx_in_warpgroup % 8) * 32, divby=32
+                    (tidx_in_warpgroup % 8) * a_elements_per_copy,
+                    divby=a_elements_per_copy,
                 )
                 tAgSFA = gSFA_mkl[(relative_sfa_token_offset, None, 0, None, 0)]
 
@@ -1779,17 +1789,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         #
                         A_gmem_slice_offset = A_gmem_thread_offset + cute.assume(
                             a_token_offset_tensor[i] * tAgA_ktile.layout[0].stride,
-                            divby=32,
+                            divby=a_elements_per_copy,
                         )
-                        A_gmem_slice_offset = cute.assume(A_gmem_slice_offset, divby=32)
+                        A_gmem_slice_offset = cute.assume(
+                            A_gmem_slice_offset, divby=a_elements_per_copy
+                        )
                         tAgA_slice_ptr = tAgA_ktile.iterator + A_gmem_slice_offset
                         tAgA_slice = cute.make_tensor(
-                            tAgA_slice_ptr, layout=cute.make_layout((32,))
+                            tAgA_slice_ptr,
+                            layout=cute.make_layout((a_elements_per_copy,)),
                         )
 
                         tAsA_slice = cute.make_tensor(
                             tAsA_ktile[(None, i, None)].iterator,
-                            layout=cute.make_layout((32,)),
+                            layout=cute.make_layout((a_elements_per_copy,)),
                         )
                         a_predicate_slice = cute.make_rmem_tensor(
                             cute.make_layout((1,)), cutlass.Boolean
@@ -1800,21 +1813,30 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
                         )
 
-                    for i in range(4):
+                    sfa_copy_groups = 1 if self.sf_vec_size == 32 else 4
+                    for i in cutlass.range_constexpr(sfa_copy_groups):
                         #
                         # Load SFA: 4x LDGSTS.32 per thread with 512-element block swizzling
                         # Each LDGSTS.32 loads 4 scale factor elements (32 bits) from GMEM to SMEM
                         # Uses same token offset as A matrix for consistent gather operation
                         #
                         swizzled_iterator = (tidx_in_warpgroup % 32) // 8 ^ i
-                        tAgSFA_slice_ptr = tAgSFA_ktile.iterator + 4 * swizzled_iterator
+                        sfa_gmem_offset = (
+                            cutlass.Int32(0)
+                            if self.sf_vec_size == 32
+                            else cutlass.Int32(4) * swizzled_iterator
+                        )
+                        tAgSFA_slice_ptr = tAgSFA_ktile.iterator + sfa_gmem_offset
                         tAgSFA_slice = cute.make_tensor(
                             tAgSFA_slice_ptr, layout=cute.make_layout((4,))
                         )
 
-                        tAsSFA_slice_ptr = (
-                            tAsSFA_ktile.iterator + 512 * swizzled_iterator
+                        sfa_smem_offset = (
+                            cutlass.Int32(0)
+                            if self.sf_vec_size == 32
+                            else cutlass.Int32(512) * swizzled_iterator
                         )
+                        tAsSFA_slice_ptr = tAsSFA_ktile.iterator + sfa_smem_offset
                         tAsSFA_slice = cute.make_tensor(
                             tAsSFA_slice_ptr, cute.make_layout((4,))
                         )
@@ -2441,7 +2463,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tCgSFC_mnl = cute.filter_zeros(tCgSFC_mnl)
                 # (T2R, T2R_M, T2R_N)
                 tCrSFC = cute.make_rmem_tensor(
-                    tCgSFC_mnl[(None, None, None, 0, 0, 0)].layout, self.sf_dtype
+                    tCgSFC_mnl[(None, None, None, 0, 0, 0)].layout, self.sfc_dtype
                 )
                 tCrSFC_pvscale = cute.make_rmem_tensor_like(tCrSFC, cutlass.Float32)
 
@@ -2739,8 +2761,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     * norm_const
                                 )
 
-                        # TODO: need to add f32x2 -> f8x2 conversion
-                        tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
+                        if cutlass.const_expr(self.sf_dtype is cutlass.Float8E8M0FNU):
+                            tCrSFC_qpvscale_up = cute.make_rmem_tensor_like(
+                                tCrSFC_pvscale, cutlass.Float32
+                            )
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                scale_ue8m0_u32 = float_to_ue8m0_fast(
+                                    tCrSFC_pvscale[vi]
+                                )
+                                tCrSFC[vi] = scale_ue8m0_u32.to(cutlass.Uint8)
+                                tCrSFC_qpvscale_up[vi] = (
+                                    ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
+                                    * norm_const
+                                )
+                        else:
+                            # TODO: need to add f32x2 -> f8x2 conversion
+                            tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
+                            tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
 
                         #
                         # Store SFC to global memory
@@ -2752,20 +2789,28 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         #
                         # Compute quantized output values and convert to C type
                         #
-                        # TODO: need to add f8x2 -> f32x2 conversion
-                        tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
                         if cutlass.const_expr(self.vectorized_f32):
                             for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
-                                acc_scale = cute.arch.mul_packed_f32x2(
-                                    (
-                                        cute.arch.rcp_approx(tCrSFC_qpvscale_up[vi]),
-                                        cute.arch.rcp_approx(
-                                            tCrSFC_qpvscale_up[vi + 1]
+                                if cutlass.const_expr(
+                                    self.sf_dtype is cutlass.Float8E8M0FNU
+                                ):
+                                    acc_scale = (
+                                        tCrSFC_qpvscale_up[vi],
+                                        tCrSFC_qpvscale_up[vi + 1],
+                                    )
+                                else:
+                                    acc_scale = cute.arch.mul_packed_f32x2(
+                                        (
+                                            cute.arch.rcp_approx(
+                                                tCrSFC_qpvscale_up[vi]
+                                            ),
+                                            cute.arch.rcp_approx(
+                                                tCrSFC_qpvscale_up[vi + 1]
+                                            ),
                                         ),
-                                    ),
-                                    (norm_const, norm_const),
-                                )
+                                        (norm_const, norm_const),
+                                    )
                                 acc_scale_min0 = fmin(acc_scale[0], fp32_max, nan=True)
                                 acc_scale_min1 = fmin(acc_scale[1], fp32_max, nan=True)
 
@@ -2778,10 +2823,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     )
                         else:
                             for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
-                                # TODO:Need to add E8M0 rcp approximation
-                                acc_scale = norm_const * cute.arch.rcp_approx(
-                                    tCrSFC_qpvscale_up[vi]
-                                )
+                                if cutlass.const_expr(
+                                    self.sf_dtype is cutlass.Float8E8M0FNU
+                                ):
+                                    acc_scale = tCrSFC_qpvscale_up[vi]
+                                else:
+                                    acc_scale = norm_const * cute.arch.rcp_approx(
+                                        tCrSFC_qpvscale_up[vi]
+                                    )
                                 acc_scale = fmin(acc_scale, fp32_max, nan=True)
 
                                 vec = tTR_rAcc_frg[None, vi]
@@ -3519,8 +3568,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        scale_k = k // scaling_vector_size
+        scale_k = cute.ceil_div(k, scaling_vector_size)
+        scale_k_tiles = cute.ceil_div(scale_k, 4)
         interm_size = n // 2
+        interm_scale_k = cute.ceil_div(interm_size, scaling_vector_size)
+        interm_scale_k_tiles = cute.ceil_div(interm_scale_k, 4)
         num_tiles = m // tile_size
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
@@ -3535,19 +3587,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         b_sf = cute.make_tensor(
             b_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, cute.ceil_div(n, 128), 4, scale_k_tiles, l),
+                order=(2, 1, 4, 0, 3, 5),
             ),
         )
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
         )
-        c_sf = cute.make_tensor(
-            c_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
+        c_sf = None
+        if cutlass.const_expr(c_sf_ptr is not None):
+            c_sf = cute.make_tensor(
+                c_sf_ptr,
+                layout=cute.make_ordered_layout(
+                    (32, 4, cute.ceil_div(m, 128), 4, interm_scale_k_tiles, l),
+                    order=(2, 1, 4, 0, 3, 5),
+                ),
+            )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
 
         tile_idx_to_group_idx = cute.make_tensor(
@@ -3562,7 +3617,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
-        global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+        global_sf = None
+        if cutlass.const_expr(global_sf_ptr is not None):
+            global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
 
         return self(
             a,

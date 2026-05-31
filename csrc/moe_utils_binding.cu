@@ -17,6 +17,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <algorithm>
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
@@ -396,3 +398,39 @@ void moe_sort(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort, moe_sort);
+
+__global__ void mask_invalid_moe_rows_kernel(int32_t* permuted_idx_to_expanded_idx,
+                                             int32_t const* tile_idx_to_mn_limit,
+                                             int32_t const* num_non_exiting_tiles,
+                                             int32_t max_num_permuted_tokens, int32_t tile_size) {
+  int32_t const active_tiles = num_non_exiting_tiles[0];
+  int32_t const stride = blockDim.x * gridDim.x;
+  for (int32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < max_num_permuted_tokens;
+       row += stride) {
+    int32_t const tile = row / tile_size;
+    bool invalid = true;
+    if (tile < active_tiles) {
+      invalid = row >= tile_idx_to_mn_limit[tile];
+    }
+    if (invalid) {
+      permuted_idx_to_expanded_idx[row] = -1;
+    }
+  }
+}
+
+void moe_mask_invalid_rows(int64_t permuted_idx_to_expanded_idx_ptr,
+                           int64_t tile_idx_to_mn_limit_ptr, int64_t num_non_exiting_tiles_ptr,
+                           int32_t max_num_permuted_tokens, int32_t tile_size,
+                           int64_t cuda_stream_ptr) {
+  constexpr int32_t block_size = 256;
+  int32_t const grid_size = std::min(1024, (max_num_permuted_tokens + block_size - 1) / block_size);
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  mask_invalid_moe_rows_kernel<<<grid_size, block_size, 0, stream>>>(
+      reinterpret_cast<int32_t*>(permuted_idx_to_expanded_idx_ptr),
+      reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
+      reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
+      tile_size);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_mask_invalid_rows, moe_mask_invalid_rows);

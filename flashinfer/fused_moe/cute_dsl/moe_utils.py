@@ -389,6 +389,33 @@ def moe_output_memset_inplace(output: torch.Tensor) -> None:
     func(output.data_ptr(), num_tokens, hidden_size, _get_cuda_stream_ptr())
 
 
+def moe_mask_invalid_rows(
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    max_num_permuted_tokens: int,
+    tile_size: int,
+) -> None:
+    """Mark inactive/padded permuted rows as invalid in a graph-safe CUDA kernel."""
+    if permuted_idx_to_expanded_idx.dtype != torch.int32:
+        raise ValueError("permuted_idx_to_expanded_idx must be int32")
+    if tile_idx_to_mn_limit.dtype != torch.int32:
+        raise ValueError("tile_idx_to_mn_limit must be int32")
+    if num_non_exiting_tiles.dtype != torch.int32:
+        raise ValueError("num_non_exiting_tiles must be int32")
+
+    module = _get_moe_utils_module()
+    func = module["flashinfer_moe_mask_invalid_rows"]
+    func(
+        permuted_idx_to_expanded_idx.data_ptr(),
+        tile_idx_to_mn_limit.data_ptr(),
+        num_non_exiting_tiles.data_ptr(),
+        max_num_permuted_tokens,
+        tile_size,
+        _get_cuda_stream_ptr(),
+    )
+
+
 # ============================ moe_sort ============================
 
 

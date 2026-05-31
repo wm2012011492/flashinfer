@@ -181,6 +181,11 @@ def _get_compiled_finalize_kernel(
     token_scales_ptr,
     max_active_clusters: int,
     stream,
+    # Dtype parameters (compile-time - IN cache key)
+    # cute.compile specializes on pointer types, so dtype must be in cache key.
+    ab_dtype: str,
+    sf_dtype: str,
+    out_dtype: str,
     # Tactic parameters (compile-time - IN cache key)
     sf_vec_size: int,
     tile_size: int,
@@ -191,7 +196,7 @@ def _get_compiled_finalize_kernel(
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    This function caches compiled kernels by tactic parameters only.
+    This function caches compiled kernels by dtype and tactic parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
     This matches TRT-LLM's approach where the same compiled kernel can be
@@ -200,8 +205,11 @@ def _get_compiled_finalize_kernel(
     """
     global _finalize_kernel_cache
 
-    # Cache key only includes tactic parameters, NOT problem dimensions
+    # Cache key includes dtype and tactic parameters, NOT problem dimensions.
     cache_key = (
+        ab_dtype,
+        sf_dtype,
+        out_dtype,
         sf_vec_size,
         tile_size,
         mma_tiler_mn,
@@ -511,6 +519,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         token_scales_ptr=token_scales_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
+        # Dtype parameters (compile-time, in cache key)
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
         # Tactic parameters (compile-time, cached)
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,

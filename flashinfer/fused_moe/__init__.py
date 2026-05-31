@@ -59,6 +59,7 @@ from .bgmv_moe import (  # noqa: F401
 try:
     from .cute_dsl import (
         cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe_mxfp8,
         CuteDslMoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
@@ -104,6 +105,7 @@ __all__ = [
 if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe_mxfp8",
         "CuteDslMoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",

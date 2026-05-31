@@ -31,7 +31,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Tuple
 
 import torch
 
@@ -48,6 +48,87 @@ from ..utils import (
 from ._inputs_helper import CuteDslMoEInputsHelper
 
 logger = logging.getLogger(__name__)
+
+
+class CuteDslMoEQuantModeConfig(NamedTuple):
+    """Static dtype/layout configuration for a CuteDSL MoE quantization mode."""
+
+    quant_mode: str
+    ab_dtype: str
+    sf_dtype: str
+    sf_vec_size: int
+    gemm1_c_dtype: str
+    input_elements_per_storage: int
+    weight_elements_per_storage: int
+    gemm1_output_elements_per_storage: int
+    gemm1_output_dtype: torch.dtype
+
+
+_CUTE_DSL_MOE_QUANT_MODE_CONFIGS: Dict[str, CuteDslMoEQuantModeConfig] = {
+    "nvfp4": CuteDslMoEQuantModeConfig(
+        quant_mode="nvfp4",
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        sf_vec_size=16,
+        gemm1_c_dtype="float4_e2m1fn",
+        input_elements_per_storage=2,
+        weight_elements_per_storage=2,
+        gemm1_output_elements_per_storage=2,
+        gemm1_output_dtype=torch.uint8,
+    ),
+    "mxfp8": CuteDslMoEQuantModeConfig(
+        quant_mode="mxfp8",
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float8_e8m0fnu",
+        sf_vec_size=32,
+        gemm1_c_dtype="float8_e4m3fn",
+        input_elements_per_storage=1,
+        weight_elements_per_storage=1,
+        gemm1_output_elements_per_storage=1,
+        gemm1_output_dtype=torch.float8_e4m3fn,
+    ),
+}
+
+
+def get_cute_dsl_moe_quant_mode_config(
+    quant_mode: str,
+) -> CuteDslMoEQuantModeConfig:
+    """Return the CuteDSL MoE dtype/layout config for ``quant_mode``."""
+    normalized = quant_mode.lower()
+    try:
+        return _CUTE_DSL_MOE_QUANT_MODE_CONFIGS[normalized]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_CUTE_DSL_MOE_QUANT_MODE_CONFIGS))
+        raise ValueError(
+            f"Unsupported CuteDSL MoE quant_mode={quant_mode!r}; "
+            f"supported modes: {supported}"
+        ) from exc
+
+
+def _quantized_tensor_initializer(
+    shapes: Tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Seeded profile tensor initializer for packed FP4 and native FP8 inputs."""
+    generator = torch.Generator(device=device).manual_seed(515)
+    if dtype == torch.uint8:
+        return torch.randint(
+            0,
+            256,
+            shapes,
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return torch.randint(
+            0,
+            256,
+            shapes,
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ).view(dtype)
+    return torch.randn(shapes, device=device, generator=generator).to(dtype)
 
 
 # =============================================================================
@@ -231,9 +312,9 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
 
 
 class CuteDslFusedMoENvfp4Runner(TunableRunner):
-    """TunableRunner for CuteDSL NVFP4 MoE kernels.
+    """TunableRunner for CuteDSL block-scaled MoE kernels.
 
-    This runner enables auto-tuning of the CuteDSL NVFP4 MoE pipeline by
+    This runner enables auto-tuning of the CuteDSL MoE pipeline by
     trying different combinations of GEMM tactics.
 
     Tactic format follows TRT-LLM style:
@@ -271,6 +352,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_fused_finalize: bool = True,
         output_dtype: torch.dtype = torch.bfloat16,
         enable_pdl: bool = True,
+        quant_mode: str = "nvfp4",
     ):
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -280,6 +362,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
+        self.quant_config = get_cute_dsl_moe_quant_mode_config(quant_mode)
+        self.quant_mode = self.quant_config.quant_mode
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -304,17 +388,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed). Seeded
-                        # for cross-process determinism of autotune picks
-                        # (matches trt-llm's seed=515 convention).
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            256,
-                            shapes,
-                            dtype=torch.uint8,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
+                        # 0: x — quantized input. Seeded for cross-process
+                        # determinism of autotune picks (matches trt-llm's
+                        # seed=515 convention).
+                        _quantized_tensor_initializer,
                         # 1: x_sf — FP8 scale factors (uint8). Seeded.
                         lambda shapes, dtype, device: torch.randint(
                             1,
@@ -371,6 +448,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.local_expert_offset,
                 self.use_fused_finalize,
                 self.output_dtype,
+                self.quant_mode,
             )
         )
 
@@ -401,25 +479,34 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
         from .moe_utils import get_max_num_permuted_tokens
 
-        # Extract problem dimensions from inputs:
-        #   0: x (num_tokens, hidden_size//2)
-        #   4: w1_weight (num_local_experts, 2*intermediate_size, hidden_size//2)
-        #   8: w2_weight (num_local_experts, hidden_size, intermediate_size//2)
+        # Extract problem dimensions from inputs.  Use w2 for hidden_size so
+        # both packed FP4 and unpacked FP8 activation layouts are handled.
         x = inputs[0]
         w1_weight = inputs[4]
+        w2_weight = inputs[8]
 
         num_tokens = x.shape[0]
-        hidden_size = x.shape[1] * 2  # FP4 packed
+        hidden_size = w2_weight.shape[1]
         num_local_experts = w1_weight.shape[0]
         intermediate_size = w1_weight.shape[1] // 2  # gate+up fused
 
-        # Fixed dtypes/layouts for NVFP4 MoE
-        ab_dtype = cutlass.Float4E2M1FN
-        sf_dtype = cutlass.Float8E4M3FN
-        sf_vec_size = 16
+        dtype_map = {
+            "float4_e2m1fn": cutlass.Float4E2M1FN,
+            "float8_e4m3fn": cutlass.Float8E4M3FN,
+            "float8_e5m2": cutlass.Float8E5M2,
+            "float8_e8m0fnu": cutlass.Float8E8M0FNU,
+        }
+        output_dtype_map = {
+            torch.float32: cutlass.Float32,
+            torch.float16: cutlass.Float16,
+            torch.bfloat16: cutlass.BFloat16,
+        }
 
-        gemm1_c_dtype = cutlass.Float4E2M1FN
-        gemm2_out_dtype = cutlass.BFloat16
+        ab_dtype = dtype_map[self.quant_config.ab_dtype]
+        sf_dtype = dtype_map[self.quant_config.sf_dtype]
+        sf_vec_size = self.quant_config.sf_vec_size
+        gemm1_c_dtype = dtype_map[self.quant_config.gemm1_c_dtype]
+        gemm2_out_dtype = output_dtype_map[self.output_dtype]
 
         valid_tactics = []
         for tactic in ALL_MOE_TACTICS:
@@ -556,6 +643,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
             enable_pdl=self.enable_pdl,
+            quant_mode=self.quant_mode,
             **kwargs,
         )
 
