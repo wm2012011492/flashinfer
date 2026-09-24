@@ -1896,7 +1896,10 @@ class FP8PerTensorMoe(Moe):
         activation_type = kwargs["activation_type"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
         gemm1_clamp_limit = kwargs.get("gemm1_clamp_limit")
-        if gemm1_clamp_limit is not None and activation_type == ActivationType.SwigluStep:
+        if (
+            gemm1_clamp_limit is not None
+            and activation_type == ActivationType.SwigluStep
+        ):
             gemm1_clamp_limit = gemm1_clamp_limit / static_data["scale_gate_fc1"]
         moe_gemm_backend = kwargs.get("moe_gemm_backend", MoeGemmBackend.TRTLLM)
         moe_op = (
@@ -3175,10 +3178,9 @@ def run_moe_dequant(args, quant_mode: QuantMode):
             elif activation_type == ActivationType.SwigluStep:
                 assert alpha is None and beta is None
                 limit = 7.0 if clamp_limit is None else clamp_limit
-                activation_output[i : i + my_num_tokens] = (
-                    torch.clamp(F.silu(my_x2), max=limit)
-                    * torch.clamp(my_x1, min=-limit, max=limit)
-                )
+                activation_output[i : i + my_num_tokens] = torch.clamp(
+                    F.silu(my_x2), max=limit
+                ) * torch.clamp(my_x1, min=-limit, max=limit)
             else:
                 if clamp_limit is not None:
                     my_x1 = torch.clamp(my_x1, min=-clamp_limit, max=clamp_limit)

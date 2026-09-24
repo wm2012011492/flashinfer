@@ -1091,7 +1091,10 @@ def test_fp8_per_tensor_swiglu_step_mixed_limits(routing_input_mode):
     _assert_per_tensor_fp8_close(runner.forward(packed), ref)
 
     # A null pointer still means physical 7 after non-unit dequantization.
-    assert default_weights.get_view("trtllm_fp8_per_tensor").get("gemm1_clamp_limit") is None
+    assert (
+        default_weights.get_view("trtllm_fp8_per_tensor").get("gemm1_clamp_limit")
+        is None
+    )
     _assert_per_tensor_fp8_close(
         runner.forward(runner.pack_inputs(default_act, default_weights)),
         all_seven_ref,

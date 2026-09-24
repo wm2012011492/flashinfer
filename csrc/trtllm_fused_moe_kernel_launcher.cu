@@ -3500,8 +3500,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     FusedMoeLauncher::check_moe_common();
 
     check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
-    TVM_FFI_ICHECK(!gemm1_clamp_limit.has_value() ||
-                   activation_type == ActivationType::SwigluStep)
+    TVM_FFI_ICHECK(!gemm1_clamp_limit.has_value() || activation_type == ActivationType::SwigluStep)
         << "FP8 per-tensor gemm1_clamp_limit is supported for SwigluStep only.";
 
     TVM_FFI_ICHECK(output1_scales_scalar.has_value())
@@ -5460,8 +5459,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
     Optional<double> routed_scaling_factor, bool use_routing_scales_on_input,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
     int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
-    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace,
-    bool is_da_body_preparation, Optional<TensorView> gemm1_clamp_limit) {
+    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Optional<TensorView> gemm1_clamp_limit) {
   // Basic type validation
   auto const dtype = hidden_states.dtype();
   auto const activation = validateAndCastActivationType(activation_type);

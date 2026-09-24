@@ -2209,9 +2209,9 @@ def test_topk_sigmoid_selects_on_raw_logits(num_tokens, num_experts, enable_pdl)
 
     expected = {num_experts // 2, num_experts - 8}  # the two largest raw logits
     topk_selected = [set(row.tolist()) for row in topk_replay.cpu()]
-    assert all(
-        selected == expected for selected in topk_selected
-    ), f"TopKSigmoid selected {topk_selected[:4]}, expected {expected} for every token"
+    assert all(selected == expected for selected in topk_selected), (
+        f"TopKSigmoid selected {topk_selected[:4]}, expected {expected} for every token"
+    )
 
     # Sigmoid cannot rank saturated scores, so it must land somewhere else. If
     # this ever matches, TopKSigmoid has silently become an alias of Sigmoid.
@@ -2515,7 +2515,10 @@ def test_fp8_per_tensor_swiglu_step_limit_validation():
         )
     with pytest.raises(ValueError, match="Invalid dtype"):
         _validate_fp8_per_tensor_step_limit(
-            ActivationType.SwigluStep, raw_limit.to(torch.bfloat16), 2, torch.device("cpu")
+            ActivationType.SwigluStep,
+            raw_limit.to(torch.bfloat16),
+            2,
+            torch.device("cpu"),
         )
 
 
@@ -2928,9 +2931,9 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
         ).to(torch.float)
         close = torch.isclose(output_ref, output_unpacked, atol=1e-2, rtol=1e-2)
         mismatch_pct = (~close).float().mean().item() * 100
-        assert (
-            mismatch_pct < 10
-        ), f"{weights.dtype} unpacked mismatch percentage is {mismatch_pct:.2f}%"
+        assert mismatch_pct < 10, (
+            f"{weights.dtype} unpacked mismatch percentage is {mismatch_pct:.2f}%"
+        )
 
 
 def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
