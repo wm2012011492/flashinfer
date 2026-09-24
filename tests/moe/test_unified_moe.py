@@ -1271,21 +1271,34 @@ class TestMoERunnerSupport:
             SiTU,
         )
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
-            (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+                SwiGLU,
+                SwiGLUStep,
+                GeGLU,
+                SiTU,
+                ReLU2,
+            ),
             (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
             (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
         }
         assert TrtllmBf16RoutedRunner.supported_activation_classes == (
             SwiGLU,
+            SwiGLUStep,
             ReLU2,
         )
         assert TrtllmFp8PerTensorRunner.supported_activation_classes == (
             SwiGLU,
+            SwiGLUStep,
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
             (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-            (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+                SwiGLU,
+                SwiGLUStep,
+                GeGLU,
+                ReLU2,
+            ),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
@@ -1298,6 +1311,24 @@ class TestMoERunnerSupport:
         )
         base.update(overrides)
         return MoEConfig(**base)
+
+    def test_trtllm_fp4_step_rejects_per_token_scaling(self, monkeypatch):
+        """Per-token NVFP4 uses a BF16 FC1 output absent from Step cubins."""
+        import flashinfer.utils as utils
+
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = self._nvfp4_swiglu(
+            activation=SwiGLUStep(7),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                per_token_scale=True,
+            ),
+        )
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
+        with pytest.raises(NotImplementedError, match="per-token NVFP4 scaling"):
+            runner.check_support()
 
     @pytest.mark.parametrize(
         ("compute_capability", "supported"),

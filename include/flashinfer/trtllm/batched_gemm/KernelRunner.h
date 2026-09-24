@@ -49,6 +49,8 @@ enum class ActType {
   GeGlu = 1,
   SiTuGlu = 2,
   None = 3,
+  // Step-3.7 clipped SwiGLU. Keep the existing values stable for pinned cubins.
+  SwiGluStep = 4,
 };
 
 static_assert(static_cast<int>(ActType::SwiGlu) ==
@@ -66,6 +68,7 @@ static_assert(static_cast<int>(ActType::SiTuGlu) ==
 static_assert(static_cast<int>(ActType::None) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::None));
 #endif
+// Assert SwiGluStep against the exported enum when the matching BMM artifact is pinned.
 
 // Type of the element-wise activation to apply after the Gemm
 enum class EltwiseActType {
